@@ -1,0 +1,33 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Frontend build and deps
+frontend/node_modules/
+frontend/dist/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# IDE and local tooling
+.idea/
+.vscode/
+.claude/
+*.log
+
+# Generated outputs
+outputs/
+tests/images/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Windows reserved-name artifact
+/nul

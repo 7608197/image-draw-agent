@@ -1,0 +1,19 @@
+name: bishe
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - numpy
+  - pillow
+  - fastapi
+  - uvicorn
+  - pip
+  - pip:
+    - torch
+    - torchvision
+    - diffusers
+    - transformers
+    - accelerate
+    - google-genai
+    - openai

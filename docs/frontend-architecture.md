@@ -1,0 +1,489 @@
+# 图生文功能架构图 (Image-to-Text Feature Architecture)
+
+## 1. 系统架构 (System Architecture)
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         User Browser                             │
+│                                                                   │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    React Frontend                          │  │
+│  │                   (Vite + Ant Design)                      │  │
+│  │                                                             │  │
+│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐     │  │
+│  │  │   App.tsx   │  │ api.ts       │  │ prompt.ts    │     │  │
+│  │  │   (UI)      │→│ (API Client) │→│ (Utils)      │     │  │
+│  │  └─────────────┘  └──────────────┘  └──────────────┘     │  │
+│  │         ↓                 ↓                                 │  │
+│  │  ┌─────────────┐  ┌──────────────┐                        │  │
+│  │  │ Upload      │  │ Display      │                        │  │
+│  │  │ Component   │  │ Results      │                        │  │
+│  │  └─────────────┘  └──────────────┘                        │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                            ↕ HTTP (multipart/form-data)          │
+└────────────────────────────┼────────────────────────────────────┘
+                             │
+                             ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                      FastAPI Backend                             │
+│                      (Port 8000)                                 │
+│                                                                   │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                     main.py                                │  │
+│  │                                                             │  │
+│  │  POST /reverse                                             │  │
+│  │  ├── Receive image file                                   │  │
+│  │  ├── Call Vision Model (Gemini/BLIP/etc)                  │  │
+│  │  ├── Generate caption                                     │  │
+│  │  ├── Generate structured prompt                           │  │
+│  │  └── Return JSON response                                 │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                            ↕                                      │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │             Vision Model / AI Service                      │  │
+│  │          (Gemini Vision / BLIP / LLaVA)                    │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. 前端组件层次结构 (Frontend Component Hierarchy)
+
+```
+App.tsx (Root Component)
+│
+├── Layout
+│   ├── Header
+│   │   └── Title: "🎨 图生文（提示词反推）"
+│   │
+│   └── Content
+│       ├── Alert (功能说明)
+│       │
+│       ├── Row (两栏布局)
+│       │   │
+│       │   ├── Col (左栏 - 图片上传)
+│       │   │   ├── Card
+│       │   │   │   ├── Dragger (拖拽上传)
+│       │   │   │   │   └── UploadOutlined Icon
+│       │   │   │   │
+│       │   │   │   ├── Divider
+│       │   │   │   │
+│       │   │   │   ├── img (图片预览)
+│       │   │   │   │
+│       │   │   │   └── Space (操作按钮)
+│       │   │   │       ├── Button (开始反推) [ReloadOutlined]
+│       │   │   │       └── Button (清空) [DeleteOutlined]
+│       │   │   │
+│       │   │   └── State: imageFile, imagePreviewUrl
+│       │   │
+│       │   └── Col (右栏 - 识别结果)
+│       │       └── Card
+│       │           ├── Spin (Loading状态)
+│       │           │
+│       │           ├── Alert (等待识别)
+│       │           │
+│       │           └── Space (结果展示)
+│       │               │
+│       │               ├── Card (Caption)
+│       │               │   ├── Title: "自然语言描述"
+│       │               │   ├── Extra: Copy Button
+│       │               │   └── Paragraph: result.caption
+│       │               │
+│       │               ├── Card (Prompt) [可选]
+│       │               │   ├── Title: "推荐 Prompt"
+│       │               │   ├── Extra: Copy Button
+│       │               │   └── Paragraph: result.prompt
+│       │               │
+│       │               ├── Card (Structured) [可选]
+│       │               │   ├── Title: "结构化提示词"
+│       │               │   ├── Extra: Copy All Button
+│       │               │   └── Tabs
+│       │               │       ├── Tab: Subject (蓝色 Tags)
+│       │               │       ├── Tab: Scene (绿色 Tags)
+│       │               │       ├── Tab: Style (紫色 Tags)
+│       │               │       ├── Tab: Tech (橙色 Tags)
+│       │               │       └── Tab: Negative (红色 Tags)
+│       │               │
+│       │               ├── Card (Tags) [可选]
+│       │               │   └── Tag[] (标签列表)
+│       │               │
+│       │               ├── Collapse (原始 JSON)
+│       │               │   └── pre: JSON.stringify(result)
+│       │               │
+│       │               └── Card (Metadata) [可选]
+│       │                   ├── duration
+│       │                   └── model
+│       │
+│       ├── Card (历史记录)
+│       │   └── List.Grid
+│       │       └── Card[] (缩略图)
+│       │           ├── Cover: img (历史图片)
+│       │           └── Meta: timestamp
+│       │
+│       └── Footer (后端地址信息)
+│           └── Text: BASE_URL
+```
+
+---
+
+## 3. 数据流 (Data Flow)
+
+```
+┌──────────────┐
+│ User Action  │
+│ (Upload)     │
+└──────┬───────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ beforeUpload Handler     │
+│ ├── Validate format      │
+│ ├── Validate size        │
+│ ├── setImageFile()       │
+│ ├── setImagePreviewUrl() │
+│ └── setResult(null)      │
+└──────┬───────────────────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ User Clicks "开始反推"    │
+└──────┬───────────────────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ handleReverse()          │
+│ ├── setLoading(true)     │
+│ └── Call API             │
+└──────┬───────────────────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ reverseImage(imageFile)  │
+│ ├── Create FormData      │
+│ ├── POST /reverse        │
+│ └── Return ReverseResponse│
+└──────┬───────────────────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ Backend Processing       │
+│ ├── Receive image        │
+│ ├── Call Vision Model    │
+│ ├── Generate caption     │
+│ ├── Generate structured  │
+│ └── Return JSON          │
+└──────┬───────────────────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ Frontend Receives Data   │
+│ ├── setResult(data)      │
+│ ├── Add to history       │
+│ ├── setLoading(false)    │
+│ └── message.success()    │
+└──────┬───────────────────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ Display Results          │
+│ ├── Caption Card         │
+│ ├── Prompt Card          │
+│ ├── Structured Tabs      │
+│ ├── Tags                 │
+│ └── Metadata             │
+└──────────────────────────┘
+```
+
+---
+
+## 4. 状态管理 (State Management)
+
+```
+App Component State:
+┌─────────────────────────────────────┐
+│ imageFile: File | null              │  ← 当前上传的文件
+├─────────────────────────────────────┤
+│ imagePreviewUrl: string             │  ← 预览 URL (ObjectURL)
+├─────────────────────────────────────┤
+│ loading: boolean                    │  ← 加载状态
+├─────────────────────────────────────┤
+│ result: ReverseResponse | null      │  ← 当前识别结果
+├─────────────────────────────────────┤
+│ history: HistoryItem[]              │  ← 历史记录数组
+└─────────────────────────────────────┘
+```
+
+---
+
+## 5. API 请求/响应流程 (API Request/Response Flow)
+
+```
+Frontend (api.ts)                Backend (main.py)
+     │                                  │
+     │  POST /reverse                   │
+     │  Content-Type:                   │
+     │  multipart/form-data             │
+     ├─────────────────────────────────>│
+     │                                  │
+     │  FormData:                       │  ┌──────────────────┐
+     │  { image: File }                 │─>│ Receive image    │
+     │                                  │  └────┬─────────────┘
+     │                                  │       │
+     │                                  │       ↓
+     │                                  │  ┌──────────────────┐
+     │                                  │  │ Decode image     │
+     │                                  │  └────┬─────────────┘
+     │                                  │       │
+     │                                  │       ↓
+     │                                  │  ┌──────────────────┐
+     │                                  │  │ Call Vision Model│
+     │                                  │  │ (Gemini/BLIP)    │
+     │                                  │  └────┬─────────────┘
+     │                                  │       │
+     │                                  │       ↓
+     │                                  │  ┌──────────────────┐
+     │                                  │  │ Generate caption │
+     │                                  │  │ Generate prompt  │
+     │                                  │  │ Generate struct  │
+     │                                  │  └────┬─────────────┘
+     │                                  │       │
+     │  200 OK                          │       ↓
+     │  Content-Type: application/json  │  ┌──────────────────┐
+     │<─────────────────────────────────┤──│ Build response   │
+     │                                  │  └──────────────────┘
+     │  {                               │
+     │    "caption": "...",             │
+     │    "prompt": "...",              │
+     │    "structured": {...},          │
+     │    "tags": [...],                │
+     │    "meta": {...}                 │
+     │  }                               │
+     │                                  │
+     ↓                                  ↓
+```
+
+---
+
+## 6. 复制功能流程 (Copy Functionality Flow)
+
+```
+User Clicks Copy Button
+       │
+       ↓
+┌──────────────────────────┐
+│ handleCopy() or          │
+│ handleCopyStructured()   │
+└──────┬───────────────────┘
+       │
+       ├─ handleCopyStructured()
+       │        │
+       │        ↓
+       │  ┌─────────────────────────┐
+       │  │ compileStructuredPrompt()│
+       │  │ ├── Join subject[]      │
+       │  │ ├── Join scene[]        │
+       │  │ ├── Join style[]        │
+       │  │ ├── Join tech[]         │
+       │  │ └── Join negative[]     │
+       │  └───┬─────────────────────┘
+       │      │
+       │      ↓
+       │  CompiledPrompt {
+       │    positive: "...",
+       │    negative: "..."
+       │  }
+       │      │
+       ↓      ↓
+┌──────────────────────────┐
+│ copyToClipboard(text)    │
+│                          │
+│ ├─ Modern Browser?       │
+│ │  ├─ Yes: navigator     │
+│ │  │       .clipboard     │
+│ │  │       .writeText()   │
+│ │  │                      │
+│ │  └─ No: execCommand    │
+│ │       ('copy')         │
+│ │                        │
+│ └─ Return success        │
+└──────┬───────────────────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ message.success() or     │
+│ message.error()          │
+└──────────────────────────┘
+```
+
+---
+
+## 7. 历史记录流程 (History Flow)
+
+```
+Recognition Success
+       │
+       ↓
+┌──────────────────────────┐
+│ Create HistoryItem       │
+│ ├── id: timestamp+random │
+│ ├── imageUrl: ObjectURL  │
+│ ├── result: Response     │
+│ └── timestamp: Date.now()│
+└──────┬───────────────────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ setHistory((prev) =>     │
+│   [newItem, ...prev]     │
+│   .slice(0, 10)          │
+│ )                        │
+└──────┬───────────────────┘
+       │
+       ↓
+┌──────────────────────────┐
+│ Render List.Grid         │
+│ ├── Card with cover      │
+│ ├── Thumbnail (120px)    │
+│ └── Timestamp            │
+└──────┬───────────────────┘
+       │
+       ↓
+User Clicks Thumbnail
+       │
+       ↓
+┌──────────────────────────┐
+│ handleViewHistory()      │
+│ ├── setImagePreviewUrl() │
+│ ├── setResult()          │
+│ └── message.info()       │
+└──────────────────────────┘
+```
+
+---
+
+## 8. 错误处理流程 (Error Handling Flow)
+
+```
+API Request
+     │
+     ├─ Network Error
+     │       │
+     │       ↓
+     │  ┌────────────────┐
+     │  │ axios.isAxiosError│
+     │  └────┬───────────┘
+     │       │
+     │       ↓
+     │  ┌────────────────┐
+     │  │ Extract message│
+     │  │ from response  │
+     │  └────┬───────────┘
+     │       │
+     │       ↓
+     │  throw new Error(message)
+     │
+     ├─ Server Error (4xx/5xx)
+     │       │
+     │       ↓
+     │  error.response.data.message
+     │
+     └─> Catch in handleReverse()
+             │
+             ↓
+        ┌────────────────┐
+        │ setLoading(false)│
+        └────┬───────────┘
+             │
+             ↓
+        ┌────────────────┐
+        │ message.error() │
+        │ "识别失败：xxx" │
+        └────────────────┘
+```
+
+---
+
+## 9. 响应式布局 (Responsive Layout)
+
+```
+Desktop (≥992px)
+┌────────────────────────────────────────────────────────┐
+│                        Header                          │
+├──────────────────────┬─────────────────────────────────┤
+│                      │                                 │
+│   左栏 (40%)         │        右栏 (60%)               │
+│                      │                                 │
+│   ┌────────────┐     │     ┌──────────────────┐       │
+│   │  Upload    │     │     │    Results       │       │
+│   │            │     │     │                  │       │
+│   │  Preview   │     │     │  Caption         │       │
+│   │            │     │     │  Prompt          │       │
+│   │  Buttons   │     │     │  Structured      │       │
+│   └────────────┘     │     └──────────────────┘       │
+│                      │                                 │
+└──────────────────────┴─────────────────────────────────┘
+
+Mobile (<992px)
+┌────────────────────────────────┐
+│           Header               │
+├────────────────────────────────┤
+│                                │
+│   ┌────────────────────────┐   │
+│   │  Upload (100%)         │   │
+│   │  Preview               │   │
+│   │  Buttons               │   │
+│   └────────────────────────┘   │
+│                                │
+│   ┌────────────────────────┐   │
+│   │  Results (100%)        │   │
+│   │  Caption               │   │
+│   │  Prompt                │   │
+│   │  Structured            │   │
+│   └────────────────────────┘   │
+│                                │
+└────────────────────────────────┘
+
+History Grid:
+Desktop: 6 columns
+Tablet:  4 columns
+Mobile:  2 columns
+```
+
+---
+
+## 10. 文件依赖关系 (File Dependencies)
+
+```
+main.tsx
+  │
+  ├── import App.tsx
+  └── import 'antd/dist/reset.css'
+
+App.tsx
+  │
+  ├── import { reverseImage } from './services/api'
+  ├── import { compileStructuredPrompt, copyToClipboard } from './utils/prompt'
+  ├── import type { ReverseResponse, HistoryItem } from './types/reverse'
+  └── import { Layout, Button, ... } from 'antd'
+
+api.ts
+  │
+  ├── import axios
+  └── import type { ReverseResponse } from '../types/reverse'
+
+prompt.ts
+  │
+  └── import type { StructuredPrompt, CompiledPrompt } from '../types/reverse'
+
+reverse.ts
+  │
+  └── (Pure TypeScript interfaces, no imports)
+```
+
+---
+
+**说明**: 本架构图展示了图生文功能的完整技术架构、组件层次、数据流、状态管理等核心设计。
+
+**版本**: v1.0
+**日期**: 2024-02-08
