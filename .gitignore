@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Build/runtime outputs
+outputs/
+.vite/
+
+# Local IDE/config
+.idea/
+.claude/agent-memory/
+.claude/settings.local.json
+
+# Secrets
+frontend/.env
+
+# Generated test artifacts
+tests/images/test_output_*.png
+tests/images/single_probe_*.png
+tests/images/last_response.json
