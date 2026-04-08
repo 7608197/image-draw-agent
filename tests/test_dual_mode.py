@@ -72,7 +72,7 @@ def test_proxy_mode():
         return True
     except Exception as e:
         print(f"\n✗ Proxy模式测试失败: {e}")
-        print("提示: 请确保远程代理服务可访问 (http://192.168.1.110:38000)")
+        print("提示: 请确保远程代理服务可访问 (请检查 IMAGE_GEN_BASE_URL / PROXY_URL)")
         return False
 
 

@@ -9,8 +9,11 @@ outputs/
 
 # Local IDE/config
 .idea/
-.claude/agent-memory/
-.claude/settings.local.json
+.claude/
+
+# Local personal files
+命令草稿
+毕设/
 
 # Secrets
 frontend/.env

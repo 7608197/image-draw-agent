@@ -49,9 +49,9 @@ class ReverseService:
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self.gemini_model = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash")
         self.gemini_client = None
-        self.cliproxy_base_url = "http://121.43.226.149:8317/v1"
-        self.cliproxy_api_key = "cc-silKI2FHUOGZfeJk9"
-        self.cliproxy_model = "gpt-5.2"
+        self.cliproxy_base_url = os.getenv("CLIPROXY_BASE_URL", "http://127.0.0.1:8317/v1")
+        self.cliproxy_api_key = os.getenv("CLIPROXY_API_KEY", "")
+        self.cliproxy_model = os.getenv("CLIPROXY_MODEL", "gpt-5.2")
         self.cliproxy_image_format = os.getenv("CLIPROXY_IMAGE_FORMAT", "auto").lower()
         self.stub_model_name = "STUB-Vision-v2"
         print(f"Initialized ReverseService with mode: {self.mode}")

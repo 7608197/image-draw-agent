@@ -5,9 +5,10 @@ import os
 # 设置环境变量解决 OpenMP 冲突
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-url = "http://192.168.1.110:38000/v1/chat/completions"
+url = os.getenv("IMAGE_GEN_DEBUG_URL", "http://127.0.0.1:38000/v1/chat/completions")
+api_key = os.getenv("IMAGE_GEN_API_KEY", "")
 headers = {
-    "Authorization": "Bearer vyJ3y6LgzPog0pjh8560gPRZWAphYvId",
+    "Authorization": f"Bearer {api_key}",
     "Content-Type": "application/json"
 }
 payload = {

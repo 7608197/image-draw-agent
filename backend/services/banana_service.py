@@ -11,12 +11,12 @@ import base64
 from services.image_response_parser import extract_image_source, extract_urls_from_text
 
 # --- 配置区域 ---
-IMAGE_GEN_MODEL = "gemini-3.0-pro-image-landsczaiape-2k"
-IMAGE_GEN_BASE_URL = "http://192.168.1.110:38000/v1"
-IMAGE_GEN_API_KEY = "vyJ3y6LgzPog0pjh8560gPRZWAphYvId"
+IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "gemini-3.0-pro-image-landsczaiape-2k")
+IMAGE_GEN_BASE_URL = os.getenv("IMAGE_GEN_BASE_URL", "http://127.0.0.1:38000/v1")
+IMAGE_GEN_API_KEY = os.getenv("IMAGE_GEN_API_KEY", "")
 
-CLIPROXY_BASE_URL = ""
-CLIPROXY_API_KEY = ""
+CLIPROXY_BASE_URL = os.getenv("CLIPROXY_BASE_URL", "")
+CLIPROXY_API_KEY = os.getenv("CLIPROXY_API_KEY", "")
 
 class BananaService:
     def __init__(self):

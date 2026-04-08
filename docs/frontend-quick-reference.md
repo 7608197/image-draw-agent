@@ -105,7 +105,7 @@ interface ReverseResponse {
 
 编辑 `.env`:
 ```env
-VITE_API_BASE_URL=http://192.168.1.110:8000
+VITE_API_BASE_URL=http://<YOUR_SERVER_IP>:8000
 ```
 
 ### 修改上传限制

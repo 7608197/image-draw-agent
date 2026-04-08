@@ -245,10 +245,10 @@ export GEMINI_API_KEY="your-real-key"
 2. 验证网络连接:
    ```bash
    # Windows
-   Test-NetConnection 192.168.1.110 -Port 38000
+   Test-NetConnection <PROXY_HOST> -Port 38000
 
    # Linux/Mac
-   nc -zv 192.168.1.110 38000
+   nc -zv <PROXY_HOST> 38000
    ```
 3. 检查API密钥是否正确
 

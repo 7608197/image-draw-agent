@@ -12,8 +12,8 @@
 
 | 配置项 | 值 |
 |--------|-----|
-| **接口地址** | `http://192.168.1.110:38000/v1/chat/completions` |
-| **API Key** | `vyJ3y6LgzPog0pjh8560gPRZWAphYvId` |
+| **接口地址** | `由环境变量配置（IMAGE_GEN_BASE_URL / PROXY_URL）` |
+| **API Key** | `请通过环境变量配置（如 IMAGE_GEN_API_KEY / PROXY_API_KEY）` |
 | **模型名称** | `gemini-3-pro-image-preview` |
 | **生成模式** | `proxy` (远程代理) |
 
@@ -77,7 +77,7 @@ python tests/test_banana_final.py
 连接测试
 ======================================================================
 
-正在测试连接到: http://192.168.1.110:38000/v1/chat/completions
+正在测试连接到: <PROXY_URL_FROM_ENV>
 响应状态码: 200
 ✓ 连接成功！服务端正常响应
 
@@ -87,10 +87,10 @@ python tests/test_banana_final.py
 ======================================================================
 
 【配置信息】
-  接口地址: http://192.168.1.110:38000/v1/chat/completions
+  接口地址: <PROXY_URL_FROM_ENV>
   模型名称: gemini-3-pro-image-preview
   生成模式: proxy (远程代理)
-  API Key: vyJ3y6LgzPog0pjh8560gPRZWAphYvId
+  API Key: 从环境变量读取（例如 IMAGE_GEN_API_KEY / PROXY_API_KEY）
 
 【初始化服务】
 [BananaService] 初始化完成
@@ -144,10 +144,10 @@ python tests/test_banana_final.py
 **解决方案**:
 ```bash
 # Windows - 测试网络连接
-Test-NetConnection 192.168.1.110 -Port 38000
+Test-NetConnection <PROXY_HOST> -Port 38000
 
 # Linux/Mac - 测试网络连接
-nc -zv 192.168.1.110 38000
+nc -zv <PROXY_HOST> 38000
 ```
 
 ### 问题 2: API Key 错误
@@ -231,7 +231,7 @@ result_path = banana_service.generate(
 
 ## 注意事项
 
-1. **网络要求**: 确保能访问 `192.168.1.110:38000`
+1. **网络要求**: 确保能访问配置的代理地址（如 `<PROXY_HOST>:38000`）
 2. **超时设置**: 默认超时 480 秒（8 分钟）
 3. **文件大小**: 生成的图片通常在 500KB - 2MB 之间
 4. **生成时间**: 通常需要 30-60 秒，取决于网络和服务端负载

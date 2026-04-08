@@ -2,10 +2,10 @@
 测试 Banana 模型通过 NewAPI 接口生成图片
 Test Banana model image generation via NewAPI interface
 
-配置信息:
-- URL: http://192.168.1.110:38000/v1/chat/completions
-- API Key: vyJ3y6LgzPog0pjh8560gPRZWAphYvId
-- Model: gemini-3-pro-image-preview
+配置信息（从环境变量读取）:
+- URL: IMAGE_GEN_BASE_URL / PROXY_URL
+- API Key: IMAGE_GEN_API_KEY / PROXY_API_KEY
+- Model: IMAGE_GEN_MODEL
 - Mode: proxy (远程代理模式)
 """
 
@@ -31,10 +31,12 @@ def test_banana_newapi_generation():
 
     # 显示配置信息
     print("\n【配置信息】")
-    print("  接口地址: http://192.168.1.110:38000/v1/chat/completions")
-    print("  模型名称: gemini-3.0-pro-image-landscape-2k")
+    base_url = os.getenv("IMAGE_GEN_BASE_URL", "http://127.0.0.1:38000/v1")
+    model_name = os.getenv("IMAGE_GEN_MODEL", "gemini-3.0-pro-image-landscape-2k")
+    print(f"  接口地址: {base_url}/chat/completions")
+    print(f"  模型名称: {model_name}")
     print("  生成模式: proxy (远程代理)")
-    print("  API Key: vyJ3y6LgzPog0pjh8560gPRZWAphYvId")
+    print("  API Key: 从环境变量读取")
 
     # 初始化 Banana Service (使用 proxy 模式)
     print("\n【初始化服务】")
@@ -126,7 +128,9 @@ def test_connection():
 
     import requests
 
-    url = "http://192.168.1.110:38000/v1/chat/completions"
+    base_url = os.getenv("IMAGE_GEN_BASE_URL", "http://127.0.0.1:38000/v1").rstrip("/")
+    api_key = os.getenv("PROXY_API_KEY", os.getenv("IMAGE_GEN_API_KEY", ""))
+    url = os.getenv("PROXY_URL", f"{base_url}/chat/completions")
 
     print(f"\n正在测试连接到: {url}")
 
@@ -136,7 +140,7 @@ def test_connection():
             url,
             headers={
                 "Content-Type": "application/json",
-                "Authorization": "Bearer vyJ3y6LgzPog0pjh8560gPRZWAphYvId"
+                "Authorization": f"Bearer {api_key}"
             },
             json={
                 "model": "gemini-3-pro-image-preview",
@@ -163,7 +167,7 @@ def test_connection():
         return False
     except requests.exceptions.ConnectionError:
         print("[ERROR] 无法连接到服务器")
-        print("提示: 请检查 IP 地址和端口是否正确，服务是否已启动")
+        print("提示: 请检查地址和端口是否正确，服务是否已启动")
         return False
     except Exception as e:
         print(f"[ERROR] 连接测试失败: {e}")
@@ -200,7 +204,7 @@ if __name__ == "__main__":
     else:
         print("[ERROR] 测试失败")
         print("\n可能的原因:")
-        print("  1. 网络连接问题 - 无法访问 192.168.1.110:38000")
+        print("  1. 网络连接问题 - 无法访问配置的代理地址")
         print("  2. API 密钥错误 - 请检查 API Key 是否正确")
         print("  3. 服务端错误 - 检查服务端日志")
         print("  4. 模型名称错误 - 确认模型是 'gemini-3-pro-image-preview'")

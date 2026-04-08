@@ -3,8 +3,8 @@ import sys
 import requests
 
 DEFAULT_MODEL = "gemini-3-pro-image-preview"
-DEFAULT_BASE_URL = "http://192.168.1.110:38000/v1"
-DEFAULT_API_KEY = "vyJ3y6LgzPog0pjh8560gPRZWAphYvId"
+DEFAULT_BASE_URL = "http://127.0.0.1:38000/v1"
+DEFAULT_API_KEY = ""
 
 
 def _print_response(label: str, response: requests.Response) -> None:
