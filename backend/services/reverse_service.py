@@ -44,14 +44,14 @@ class ReverseService:
     # 3) 编译为可直接使用的正/负提示词并落盘
 
     def __init__(self):
-        # 当前默认走 cliproxy；可切到 gemini，异常时回退到 stub
-        self.mode = "cliproxy"
+        # 当前默认走 cliproxy；可通过 REVERSE_MODE 切到 gemini / stub
+        self.mode = os.getenv("REVERSE_MODE", "cliproxy")
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self.gemini_model = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash")
         self.gemini_client = None
-        self.cliproxy_base_url = os.getenv("CLIPROXY_BASE_URL", "http://127.0.0.1:8317/v1")
-        self.cliproxy_api_key = os.getenv("CLIPROXY_API_KEY", "")
-        self.cliproxy_model = os.getenv("CLIPROXY_MODEL", "gpt-5.2")
+        self.cliproxy_base_url = os.getenv("CLIPROXY_BASE_URL", "http://192.168.1.110:8317/v1")
+        self.cliproxy_api_key = os.getenv("CLIPROXY_API_KEY", "sk-cpa-7d9k2m5p8r4v1x6w9q")
+        self.cliproxy_model = os.getenv("CLIPROXY_MODEL", "gpt-5.4")
         self.cliproxy_image_format = os.getenv("CLIPROXY_IMAGE_FORMAT", "auto").lower()
         self.stub_model_name = "STUB-Vision-v2"
         print(f"Initialized ReverseService with mode: {self.mode}")
@@ -105,11 +105,7 @@ class ReverseService:
         raise ValueError("Incomplete JSON object in model response")
 
     def _extract_responses_text(self, data: Dict[str, Any]) -> str:
-        # 从 /responses 接口返回体中提取模型文本内容。
-        # 兼容两类结构：
-        # 1) 顶层 output_text
-        # 2) output[].content[] 中 type=output_text/text 的片段
-        # 找到第一个非空文本即返回；若都没有则返回空字符串。
+        # 从 /responses 非流式返回体中提取模型文本内容。
         if not isinstance(data, dict):
             return ""
         output_text = data.get("output_text")
@@ -128,6 +124,31 @@ class ReverseService:
                                     if text:
                                         return text
         return ""
+
+    def _extract_responses_stream_text(self, response: requests.Response) -> str:
+        # 从 /responses SSE 流中提取最终输出文本。
+        text_parts: List[str] = []
+        done_text = ""
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line or not raw_line.startswith("data: "):
+                continue
+            payload_text = raw_line[6:]
+            try:
+                event = json.loads(payload_text)
+            except json.JSONDecodeError:
+                continue
+            event_type = event.get("type")
+            if event_type == "response.output_text.delta":
+                delta = event.get("delta")
+                if isinstance(delta, str):
+                    text_parts.append(delta)
+            elif event_type == "response.output_text.done":
+                text = event.get("text")
+                if isinstance(text, str) and text:
+                    done_text = text
+        if done_text:
+            return done_text
+        return "".join(text_parts).strip()
 
     def _ensure_list(self, value: Any) -> List[str]:
         # 将任意输入统一归一化为 List[str]：
@@ -433,6 +454,26 @@ class ReverseService:
             "Rules: JSON only, no code fences. Use short English prompt terms."
         )
 
+    def _get_text_schema_prompt(self, text: str) -> str:
+        return (
+            "You are a prompt normalization model. "
+            "Rewrite the user's natural language into a cleaner caption and structured prompt object. "
+            "Infer missing visual details conservatively. Return ONLY valid JSON with this schema:\n"
+            "{\n"
+            "  \"caption\": \"...\",\n"
+            "  \"confidence\": 0.0,\n"
+            "  \"structured\": {\n"
+            "    \"subject\": {\"entities\": [\"\"], \"label\": \"\", \"attributes\": {}, \"count\": 1, \"weight\": 1.0},\n"
+            "    \"scene\": {\"environment\": [], \"background\": [], \"time_weather\": [], \"composition\": []},\n"
+            "    \"style\": {\"medium\": [], \"artist_style\": [], \"aesthetic\": [], \"quality\": []},\n"
+            "    \"tech\": {\"lighting\": [], \"camera\": [], \"color_tone\": [], \"render\": []},\n"
+            "    \"negative\": {\"terms\": [], \"severity\": \"medium\", \"term_weights\": [{\"term\": \"\", \"weight\": 1.0}]}\n"
+            "  }\n"
+            "}\n"
+            "Rules: JSON only, no code fences. Use short English prompt terms.\n"
+            f"User text: {text}"
+        )
+
     def analyze_image_gemini(self, image_bytes: bytes, mime_type: str) -> Dict[str, Any]:
         """Analyze image with Gemini Vision and return parsed JSON."""
         client = self._get_gemini_client()
@@ -467,6 +508,86 @@ class ReverseService:
             "raw": {
                 "model_response": text,
                 "parsed": payload,
+            },
+        }
+
+    def analyze_text_gemini(self, text: str) -> Dict[str, Any]:
+        client = self._get_gemini_client()
+        prompt = self._get_text_schema_prompt(text)
+
+        response = client.models.generate_content(
+            model=self.gemini_model,
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(prompt)],
+                )
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=2048,
+            ),
+        )
+
+        content = response.text or ""
+        payload = self._extract_json_object(content)
+        return {
+            "caption": str(payload.get("caption", "")),
+            "structured": payload.get("structured", {}),
+            "confidence": float(payload.get("confidence", 0.75)) if payload.get("confidence") is not None else 0.75,
+            "model_used": self.gemini_model,
+            "raw": {
+                "model_response": content,
+                "parsed": payload,
+                "input_type": "text",
+            },
+        }
+
+    def analyze_text_stub(self, text: str) -> Dict[str, Any]:
+        normalized_text = (text or "").strip()
+        label = normalized_text.split(",", 1)[0].strip() if normalized_text else "text prompt"
+        if len(label) > 80:
+            label = label[:77].rstrip() + "..."
+
+        return {
+            "caption": normalized_text or "Text prompt analysis result.",
+            "structured": {
+                "subject": {
+                    "label": label or "text prompt",
+                    "entities": [],
+                    "attributes": {},
+                    "count": 1,
+                    "weight": 1.0,
+                },
+                "scene": {
+                    "environment": [],
+                    "background": [],
+                    "time_weather": [],
+                    "composition": [],
+                },
+                "style": {
+                    "medium": [],
+                    "artist_style": [],
+                    "aesthetic": [],
+                    "quality": [],
+                },
+                "tech": {
+                    "lighting": [],
+                    "camera": [],
+                    "color_tone": [],
+                    "render": [],
+                },
+                "negative": {
+                    "terms": [],
+                    "severity": "medium",
+                    "term_weights": [],
+                },
+            },
+            "confidence": 0.35,
+            "model_used": self.stub_model_name,
+            "raw": {
+                "stub_mode": True,
+                "input_type": "text",
             },
         }
 
@@ -583,56 +704,95 @@ class ReverseService:
         last_error: Optional[str] = None
         for item in payloads:
             prompt = self._get_base_schema_prompt()
-            responses_payload = {
-                "model": self.cliproxy_model,
-                "input": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": prompt},
-                            {"type": "input_image", "image_url": item["payload"]["messages"][0]["content"][1]["image_url"] if isinstance(item["payload"]["messages"][0]["content"][1].get("image_url"), str) else item["payload"]["messages"][0]["content"][1]["image_url"]["url"]},
-                        ],
-                    }
-                ],
-            }
+            responses_image_url: Optional[str] = None
 
-            response = requests.post(responses_endpoint, headers=headers, json=responses_payload, timeout=60)
-            if response.status_code == 200:
-                data = response.json()
-                content = self._extract_responses_text(data)
-                # /responses 返回结构可能有差异，先统一提取文本，再做 JSON 严格解析。
-                if not content:
-                    last_error = f"{item['name']}: empty response"
-                    continue
-                # 同样执行 JSON 提取与解析，确保下游拿到的是结构化字典。
-                payload = self._extract_json_object(content)
-                return {
-                    "caption": str(payload.get("caption", "")),
-                    "structured": payload.get("structured", {}),
-                    "confidence": float(payload.get("confidence", 0.75)) if payload.get("confidence") is not None else 0.75,
-                    "model_used": self.cliproxy_model,
-                    "raw": {
-                        "model_response": content,
-                        "parsed": payload,
-                        "image_format": item["name"],
-                        "endpoint": "responses",
-                    },
+            if item["name"] == "top_level_images":
+                images = item["payload"].get("images") or []
+                if images:
+                    responses_image_url = f"data:{mime_type};base64,{images[0]}"
+            else:
+                content_items = item["payload"]["messages"][0].get("content") or []
+                if len(content_items) > 1:
+                    image_part = content_items[1]
+                    raw_image_url = image_part.get("image_url")
+                    if isinstance(raw_image_url, str):
+                        responses_image_url = raw_image_url
+                    elif isinstance(raw_image_url, dict):
+                        responses_image_url = raw_image_url.get("url")
+                    elif image_part.get("type") == "image" and image_part.get("image"):
+                        responses_image_url = f"data:{mime_type};base64,{image_part['image']}"
+
+            if responses_image_url:
+                responses_payload = {
+                    "model": self.cliproxy_model,
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": prompt},
+                                {"type": "input_image", "image_url": responses_image_url},
+                            ],
+                        }
+                    ],
                 }
 
-            last_error = f"responses {item['name']}: {response.status_code} {response.text}"
+                response = requests.post(responses_endpoint, headers=headers, json=responses_payload, timeout=60)
+                if response.status_code == 200:
+                    data = response.json()
+                    content = self._extract_responses_text(data)
+                    if not content:
+                        stream_response = requests.post(
+                            responses_endpoint,
+                            headers=headers,
+                            json={**responses_payload, "stream": True},
+                            timeout=60,
+                            stream=True,
+                        )
+                        if stream_response.status_code == 200:
+                            content = self._extract_responses_stream_text(stream_response)
+                        else:
+                            last_error = f"responses-stream {item['name']}: {stream_response.status_code}"
+                    if content:
+                        payload = self._extract_json_object(content)
+                        return {
+                            "caption": str(payload.get("caption", "")),
+                            "structured": payload.get("structured", {}),
+                            "confidence": float(payload.get("confidence", 0.75)) if payload.get("confidence") is not None else 0.75,
+                            "model_used": self.cliproxy_model,
+                            "raw": {
+                                "model_response": content,
+                                "parsed": payload,
+                                "image_format": item["name"],
+                                "endpoint": "responses",
+                            },
+                        }
+                    last_error = f"responses {item['name']}: empty response"
+                    if item["name"] != "top_level_images":
+                        continue
+                else:
+                    last_error = f"responses {item['name']}: {response.status_code} {response.text}"
 
             response = requests.post(chat_endpoint, headers=headers, json=item["payload"], timeout=60)
             if response.status_code != 200:
                 last_error = f"chat {item['name']}: {response.status_code} {response.text}"
                 continue
             data = response.json()
-            content = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
+            message = data.get("choices", [{}])[0].get("message", {})
+            content = message.get("content")
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text")
+                        if text:
+                            text_parts.append(text)
+                content = "\n".join(text_parts).strip()
             if not content:
-                last_error = f"chat {item['name']}: empty response"
+                refusal = message.get("refusal")
+                if refusal:
+                    last_error = f"chat {item['name']}: {refusal}"
+                else:
+                    last_error = f"chat {item['name']}: empty response"
                 continue
 
             payload = self._extract_json_object(content)
@@ -650,6 +810,109 @@ class ReverseService:
             }
 
         raise RuntimeError(last_error or "Cliproxy request failed")
+
+    def _analyze_text_cliproxy(self, text: str) -> Dict[str, Any]:
+        if not self.cliproxy_base_url:
+            raise ValueError("CLIPROXY_BASE_URL is not set")
+        if not self.cliproxy_api_key:
+            raise ValueError("CLIPROXY_API_KEY is not set")
+
+        base_url = self.cliproxy_base_url.rstrip("/")
+        responses_endpoint = base_url + "/responses"
+        chat_endpoint = base_url + "/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.cliproxy_api_key}",
+            "Content-Type": "application/json",
+        }
+        prompt = self._get_text_schema_prompt(text)
+        payload = {
+            "model": self.cliproxy_model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                    ],
+                }
+            ],
+        }
+
+        response = requests.post(responses_endpoint, headers=headers, json=payload, timeout=60)
+        if response.status_code == 200:
+            data = response.json()
+            content = self._extract_responses_text(data)
+            if not content:
+                stream_response = requests.post(
+                    responses_endpoint,
+                    headers=headers,
+                    json={**payload, "stream": True},
+                    timeout=60,
+                    stream=True,
+                )
+                if stream_response.status_code == 200:
+                    content = self._extract_responses_stream_text(stream_response)
+                else:
+                    logger.warning("Text responses stream failed: %s", stream_response.status_code)
+            if content:
+                payload_json = self._extract_json_object(content)
+                return {
+                    "caption": str(payload_json.get("caption", "")),
+                    "structured": payload_json.get("structured", {}),
+                    "confidence": float(payload_json.get("confidence", 0.75)) if payload_json.get("confidence") is not None else 0.75,
+                    "model_used": self.cliproxy_model,
+                    "raw": {
+                        "model_response": content,
+                        "parsed": payload_json,
+                        "endpoint": "responses",
+                        "input_type": "text",
+                    },
+                }
+        else:
+            logger.warning("Text responses request failed: %s %s", response.status_code, response.text)
+
+        chat_payload = {
+            "model": self.cliproxy_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+        }
+        chat_response = requests.post(chat_endpoint, headers=headers, json=chat_payload, timeout=60)
+        if chat_response.status_code != 200:
+            raise RuntimeError(f"text chat: {chat_response.status_code} {chat_response.text}")
+
+        data = chat_response.json()
+        message = data.get("choices", [{}])[0].get("message", {})
+        content = message.get("content")
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    part_text = part.get("text")
+                    if part_text:
+                        text_parts.append(part_text)
+            content = "\n".join(text_parts).strip()
+        if not content:
+            refusal = message.get("refusal")
+            if refusal:
+                raise RuntimeError(f"text chat: {refusal}")
+            raise RuntimeError("text chat: empty response")
+
+        payload_json = self._extract_json_object(content)
+        return {
+            "caption": str(payload_json.get("caption", "")),
+            "structured": payload_json.get("structured", {}),
+            "confidence": float(payload_json.get("confidence", 0.75)) if payload_json.get("confidence") is not None else 0.75,
+            "model_used": self.cliproxy_model,
+            "raw": {
+                "model_response": content,
+                "parsed": payload_json,
+                "endpoint": "chat",
+                "input_type": "text",
+            },
+        }
 
     def _serialize_response(self, response: ReverseResponse) -> Dict[str, Any]:
         if hasattr(response, "model_dump"):
@@ -750,6 +1013,74 @@ class ReverseService:
 
         self._save_outputs(image_id, response, compiled)
         return response
+
+    async def reverse_text(self, text: str, params: Optional[ParamsBlock] = None) -> ReverseResponse:
+        start_time = time.time()
+        normalized_text = (text or "").strip()
+        if not normalized_text:
+            raise ValueError("Text input cannot be empty")
+
+        if self.mode == "gemini":
+            if not self.gemini_api_key or "你的_API_KEY" in self.gemini_api_key:
+                logger.warning("Gemini API key not configured, falling back to STUB mode for text reverse")
+                analysis = self.analyze_text_stub(normalized_text)
+            else:
+                try:
+                    analysis = self.analyze_text_gemini(normalized_text)
+                except Exception as e:
+                    logger.error("Gemini text analysis failed, falling back to STUB: %s", e, exc_info=True)
+                    analysis = self.analyze_text_stub(normalized_text)
+                    raw = analysis.get("raw")
+                    if isinstance(raw, dict):
+                        raw["gemini_error"] = str(e)
+                    else:
+                        analysis["raw"] = {"gemini_error": str(e)}
+        elif self.mode == "cliproxy":
+            if not self.cliproxy_api_key:
+                logger.warning("Cliproxy API key not configured, falling back to STUB mode for text reverse")
+                analysis = self.analyze_text_stub(normalized_text)
+            else:
+                try:
+                    analysis = self._analyze_text_cliproxy(normalized_text)
+                except Exception as e:
+                    logger.error("Cliproxy text analysis failed, falling back to STUB: %s", e, exc_info=True)
+                    analysis = self.analyze_text_stub(normalized_text)
+                    raw = analysis.get("raw")
+                    if isinstance(raw, dict):
+                        raw["cliproxy_error"] = str(e)
+                    else:
+                        analysis["raw"] = {"cliproxy_error": str(e)}
+        else:
+            analysis = self.analyze_text_stub(normalized_text)
+
+        effective_params = params or ParamsBlock()
+        structured = self._build_structured_prompt(analysis.get("structured", {}), effective_params)
+        compiled = self.compile_structured_prompt(structured)
+        processing_time_ms = max(1, int((time.time() - start_time) * 1000))
+        text_id = hashlib.sha256(
+            json.dumps(
+                {
+                    "text": normalized_text,
+                    "params": effective_params.model_dump() if hasattr(effective_params, "model_dump") else effective_params.dict(),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+
+        return ReverseResponse(
+            schema_version="2.0.0",
+            id=text_id,
+            caption=analysis.get("caption", normalized_text) or normalized_text,
+            structured=structured,
+            prompt=compiled["positive"],
+            meta=ReverseMeta(
+                model_used=analysis.get("model_used", self.stub_model_name),
+                confidence=analysis.get("confidence", 0.0),
+                processing_time_ms=processing_time_ms,
+            ),
+            raw=analysis.get("raw"),
+        )
 
 
 # Singleton instance

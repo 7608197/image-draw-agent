@@ -21,6 +21,7 @@ import {
   InputNumber,
   Input,
   Switch,
+  Modal,
 } from 'antd';
 import {
   CopyOutlined,
@@ -31,8 +32,8 @@ import {
   UploadOutlined,
 } from '@ant-design/icons';
 import type { UploadProps } from 'antd';
-import { reverseImage, generateImage, BASE_URL } from './services/api';
-import type { GenerateOptions } from './services/api';
+import { reverseImage, reverseText, generateImage, BASE_URL } from './services/api';
+import type { GenerateOptions, TextReverseOptions } from './services/api';
 import type { ReverseResponse, HistoryItem, GenerateResponse } from './types/reverse';
 import { compileStructuredPrompt, copyToClipboard } from './utils/prompt';
 
@@ -61,6 +62,10 @@ function App() {
   const [genSampler, setGenSampler] = useState<string>('DPM++ 2M Karras');
   const [genNegativePrompt, setGenNegativePrompt] = useState<string>('');
   const [genStrictJson, setGenStrictJson] = useState<boolean>(false);
+  const [textReverseOpen, setTextReverseOpen] = useState(false);
+  const [textReverseLoading, setTextReverseLoading] = useState(false);
+  const [textReverseInput, setTextReverseInput] = useState('');
+  const [activeTab, setActiveTab] = useState<'reverse' | 'generate'>('reverse');
 
   // 上传配置
   const uploadProps: UploadProps = {
@@ -237,6 +242,63 @@ function App() {
     }
   };
 
+  const handleTextReverse = async () => {
+    const normalizedInput = textReverseInput.trim();
+    if (!normalizedInput) {
+      message.warning('请输入自然语言描述');
+      return;
+    }
+
+    setTextReverseOpen(false);
+    setTextReverseLoading(true);
+    setResult(null);
+
+    try {
+      const options: TextReverseOptions = {
+        params: {
+          size: genSize,
+          steps: genSteps,
+          cfg: genCfg,
+          sampler: genSampler,
+          seed: genSeedLocked ? genSeed : null,
+        },
+      };
+      const data = await reverseText(normalizedInput, options);
+      setResult(data);
+      const payload = {
+        caption: data.caption,
+        prompt: data.prompt,
+        structured: data.structured,
+      };
+      const text = JSON.stringify(payload, null, 2);
+      const file = new File([text], `reverse-${data.id}.json`, { type: 'application/json' });
+      setGenJsonFile(file);
+      setGenJsonPreview(text);
+      setTextReverseInput('');
+      message.success('结构化成功！');
+    } catch (error) {
+      setTextReverseOpen(true);
+      message.error(`结构化失败：${error instanceof Error ? error.message : '未知错误'}`);
+      console.error('文本结构化错误:', error);
+    } finally {
+      setTextReverseLoading(false);
+    }
+  };
+
+  const handleUseForGenerate = async () => {
+    if (!result) return;
+    const payload = {
+      caption: result.caption,
+      prompt: result.prompt,
+      structured: result.structured,
+    };
+    const text = JSON.stringify(payload, null, 2);
+    const file = new File([text], `reverse-${result.id}.json`, { type: 'application/json' });
+    setGenJsonFile(file);
+    setGenJsonPreview(text);
+    message.success('已回填到生成流程，请切换到“文生图”继续生成');
+  };
+
   // 复制文本
   const handleCopy = async (text: string, label: string) => {
     const success = await copyToClipboard(text);
@@ -307,7 +369,31 @@ function App() {
       </Header>
 
       <Content style={{ padding: '24px', maxWidth: '1400px', margin: '0 auto', width: '100%' }}>
+        <Modal
+          title="自然语言结构化提示词"
+          open={textReverseOpen}
+          onOk={handleTextReverse}
+          onCancel={() => setTextReverseOpen(false)}
+          confirmLoading={textReverseLoading}
+          okText="开始结构化"
+          cancelText="取消"
+        >
+          <Space direction="vertical" style={{ width: '100%' }} size="middle">
+            <Paragraph type="secondary">
+              输入自然语言描述，系统会先规范文本，再生成结构化提示词对象。
+            </Paragraph>
+            <Input.TextArea
+              rows={6}
+              value={textReverseInput}
+              onChange={(e) => setTextReverseInput(e.target.value)}
+              placeholder="例如：一个站在雨夜街头的赛博朋克少女，霓虹灯，电影感，近景，高清细节"
+            />
+          </Space>
+        </Modal>
+
         <Tabs
+          activeKey={activeTab}
+          onChange={(key) => setActiveTab(key as 'reverse' | 'generate')}
           items={[
             {
               key: 'reverse',
@@ -325,6 +411,12 @@ function App() {
                   <Row gutter={24}>
                     <Col xs={24} lg={10}>
                       <Card title="图片上传" bordered={false}>
+                        <Space style={{ width: '100%', marginBottom: '16px' }} wrap>
+                          <Button type="dashed" onClick={() => setTextReverseOpen(true)}>
+                            自然语言结构化
+                          </Button>
+                        </Space>
+
                         <Dragger {...uploadProps} showUploadList={false}>
                           <p className="ant-upload-drag-icon">
                             <FileImageOutlined style={{ fontSize: '48px', color: '#1890ff' }} />
@@ -374,14 +466,16 @@ function App() {
 
                     <Col xs={24} lg={14}>
                       <Card title="识别结果" bordered={false}>
-                        {loading && (
+                        {(loading || textReverseLoading) && (
                           <div style={{ textAlign: 'center', padding: '48px' }}>
                             <Spin size="large" />
-                            <Paragraph style={{ marginTop: '16px' }}>正在识别中，请稍候...</Paragraph>
+                            <Paragraph style={{ marginTop: '16px' }}>
+                              {textReverseLoading ? '正在结构化中，请稍候...' : '正在识别中，请稍候...'}
+                            </Paragraph>
                           </div>
                         )}
 
-                        {!loading && !result && (
+                        {!loading && !textReverseLoading && !result && (
                           <Alert
                             message="等待识别"
                             description="请上传图片并点击'开始反推/识别'按钮"
@@ -390,7 +484,7 @@ function App() {
                           />
                         )}
 
-                        {!loading && result && (
+                        {!loading && !textReverseLoading && result && (
                           <Space direction="vertical" style={{ width: '100%' }} size="large">
                             <Card
                               type="inner"
@@ -434,6 +528,9 @@ function App() {
                                   </Button>
                                   <Button icon={<DownloadOutlined />} onClick={handleDownloadTxt}>
                                     下载 TXT
+                                  </Button>
+                                  <Button type="primary" onClick={handleUseForGenerate}>
+                                    用于生成
                                   </Button>
                                 </Space>
                               </Card>
