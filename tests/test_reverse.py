@@ -165,5 +165,10 @@ def test_prompt_has_weights(test_image_bytes):
     print(f"\nPrompt format validated: {prompt}")
 
 
+def test_reverse_text_empty_input():
+    response = client.post("/reverse/text", json={"text": "   "})
+    assert response.status_code == 400
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

@@ -87,6 +87,9 @@ export interface GenerateMeta {
   model_used: string;
   processing_time_ms: number;
   mode?: 'sd' | 'gemini' | 'proxy';
+  requested_mode?: 'sd' | 'gemini' | 'proxy';
+  fallback_used?: boolean;
+  fallback_from?: 'sd' | 'gemini' | 'proxy';
   reproducibility?: 'strong' | 'best_effort';
   style_applied?: string | null;
   prompt_source?: 'structured' | 'legacy' | 'json_spec' | string;
@@ -108,6 +111,57 @@ export interface GenerateResponse {
   image_url: string;
   meta: GenerateMeta;
   raw?: Record<string, unknown>;
+}
+
+export interface AgentMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+  ts: number;
+}
+
+export interface AgentConfirmOption {
+  id: string;
+  label: string;
+}
+
+export interface AgentOperationProposal {
+  path: string;
+  operation: string;
+  value?: unknown;
+  description?: string | null;
+  before?: unknown;
+  after?: unknown;
+}
+
+export type AgentOperationDecision = 'yes' | 'no';
+
+export interface AgentConfirmPayload {
+  confirmation_id: string;
+  message: string;
+  summary: string;
+  reasoning?: string | null;
+  operations: AgentOperationProposal[];
+  options: AgentConfirmOption[];
+}
+
+export interface AgentConfirmRequest {
+  confirmation_id: string;
+  choice: string;
+  mode?: 'accept_all' | 'multi' | 'custom_prompt' | 'cancel';
+  selected_operation_indexes?: number[];
+  custom_text?: string;
+}
+
+export interface AgentChatRequest {
+  user_input: string;
+  current_prompt: StructuredPrompt;
+}
+
+export interface AgentChatResponse {
+  message: string;
+  updated_prompt: StructuredPrompt;
+  prompt?: string | null;
+  negative_prompt?: string | null;
 }
 
 // 历史记录项

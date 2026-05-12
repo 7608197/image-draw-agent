@@ -2,6 +2,8 @@ import os
 import requests
 import json
 import traceback
+import socket
+from pathlib import Path
 from PIL import Image
 from io import BytesIO
 import base64
@@ -25,7 +27,8 @@ except ImportError:
     types = None
 
 import io
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
+from requests.exceptions import ConnectionError as RequestsConnectionError, ConnectTimeout, ReadTimeout
 
 try:
     from .image_response_parser import extract_image_source, extract_urls_from_text
@@ -50,7 +53,22 @@ PROXY_API_KEY = os.getenv("PROXY_API_KEY", IMAGE_GEN_API_KEY)
 REMOTE_MODEL_NAME = os.getenv("REMOTE_MODEL_NAME", IMAGE_GEN_MODEL)
 
 # 本地 Stable Diffusion 配置
-SD_MODEL_ID = os.getenv("SD_MODEL_ID", "runwayml/stable-diffusion-v1-5")
+SD_MODEL_ID = os.getenv("SD_MODEL_ID", "stabilityai/sd-turbo")
+SD_TURBO_RECOMMENDED_SIZE = os.getenv("SD_TURBO_RECOMMENDED_SIZE", "512x512")
+SD_TURBO_RECOMMENDED_STEPS = int(os.getenv("SD_TURBO_RECOMMENDED_STEPS", "4"))
+SD_TURBO_RECOMMENDED_CFG = float(os.getenv("SD_TURBO_RECOMMENDED_CFG", "1.5"))
+HUGGINGFACE_HUB_CACHE = Path(os.getenv("HUGGINGFACE_HUB_CACHE", Path.home() / ".cache" / "huggingface" / "hub"))
+
+# 失败回退配置
+IMAGE_GEN_FALLBACK_ENABLED = os.getenv("IMAGE_GEN_FALLBACK_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+IMAGE_GEN_FALLBACK_TARGET = os.getenv("IMAGE_GEN_FALLBACK_TARGET", "sd").strip().lower() or "sd"
+IMAGE_GEN_FALLBACK_FROM = {
+    item.strip().lower()
+    for item in os.getenv("IMAGE_GEN_FALLBACK_FROM", "gemini,proxy").split(",")
+    if item.strip()
+}
+PROXY_CONNECT_TIMEOUT_SECONDS = float(os.getenv("PROXY_CONNECT_TIMEOUT_SECONDS", "5"))
+PROXY_READ_TIMEOUT_SECONDS = float(os.getenv("PROXY_READ_TIMEOUT_SECONDS", "20"))
 
 
 class BananaService:
@@ -70,6 +88,25 @@ class BananaService:
         print(f"[BananaService] 默认模式: {self.mode}")
         print(f"[BananaService] 计算设备: {self.device}")
 
+    def _resolve_cached_model_path(self) -> Optional[Path]:
+        repo_dir = HUGGINGFACE_HUB_CACHE / f"models--{SD_MODEL_ID.replace('/', '--')}"
+        snapshots_dir = repo_dir / "snapshots"
+        if not snapshots_dir.exists():
+            return None
+
+        snapshots = sorted((p for p in snapshots_dir.iterdir() if p.is_dir()), reverse=True)
+        for snapshot in snapshots:
+            required_paths = [
+                snapshot / "model_index.json",
+                snapshot / "text_encoder",
+                snapshot / "tokenizer",
+                snapshot / "unet",
+                snapshot / "vae",
+            ]
+            if all(path.exists() for path in required_paths):
+                return snapshot
+        return None
+
     def load_sd_model(self):
         """加载本地 Stable Diffusion 模型 (懒加载)"""
         if self.sd_pipe is not None:
@@ -79,10 +116,29 @@ class BananaService:
             raise ImportError("SD 模式需要安装 torch 和 diffusers 依赖")
 
         print(f"[BananaService] 正在加载本地 Stable Diffusion 模型: {SD_MODEL_ID}")
-        self.sd_pipe = StableDiffusionPipeline.from_pretrained(
-            SD_MODEL_ID,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
-        )
+        cached_model_path = self._resolve_cached_model_path()
+        if cached_model_path is None:
+            raise RuntimeError(
+                f"本地 SD 模型不可用：未找到 {SD_MODEL_ID} 的本地缓存。"
+                "当前不会再尝试联网下载，请先恢复 Hugging Face 缓存或改用可用模式。"
+            )
+
+        print(f"[BananaService] 使用本地缓存模型: {cached_model_path}")
+        try:
+            self.sd_pipe = StableDiffusionPipeline.from_pretrained(
+                str(cached_model_path),
+                torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+                local_files_only=True,
+            )
+        except Exception as exc:
+            message = str(exc)
+            timeout_like = isinstance(exc, TimeoutError) or isinstance(exc, socket.timeout) or 'ConnectTimeout' in message or 'timed out' in message
+            if timeout_like:
+                raise RuntimeError(
+                    f"本地 SD 模型加载失败：无法连接到 Hugging Face 下载 {SD_MODEL_ID}。"
+                    "如果你之前能本地生图，通常说明当前网络不可达，或模型缓存已丢失。"
+                ) from exc
+            raise RuntimeError(f"本地 SD 模型加载失败：{message}") from exc
         self.sd_pipe.to(self.device)
         print(f"[BananaService] 本地 SD 模型加载完毕！(设备: {self.device})")
         return self.sd_pipe
@@ -117,22 +173,37 @@ class BananaService:
         try:
             pipe = self.load_sd_model()
             call_kwargs = {}
+            is_sd_turbo = SD_MODEL_ID.strip().lower() == "stabilityai/sd-turbo"
 
             if negative_prompt:
                 call_kwargs["negative_prompt"] = negative_prompt
             if seed is not None and torch is not None:
                 call_kwargs["generator"] = torch.Generator(device=self.device).manual_seed(int(seed))
-            if steps is not None:
-                call_kwargs["num_inference_steps"] = int(steps)
-            if cfg is not None:
-                call_kwargs["guidance_scale"] = float(cfg)
 
-            parsed_size = self._parse_size(size)
+            effective_steps = int(steps) if steps is not None else None
+            effective_cfg = float(cfg) if cfg is not None else None
+            effective_size = size
+
+            if is_sd_turbo:
+                effective_steps = effective_steps if effective_steps is not None and effective_steps <= 8 else SD_TURBO_RECOMMENDED_STEPS
+                effective_cfg = effective_cfg if effective_cfg is not None and effective_cfg <= 3.0 else SD_TURBO_RECOMMENDED_CFG
+                effective_size = effective_size or SD_TURBO_RECOMMENDED_SIZE
+                print(
+                    f"[BananaService] [SD模式] 检测到 sd-turbo，使用兼容参数: "
+                    f"steps={effective_steps}, cfg={effective_cfg}, size={effective_size}"
+                )
+
+            if effective_steps is not None:
+                call_kwargs["num_inference_steps"] = effective_steps
+            if effective_cfg is not None:
+                call_kwargs["guidance_scale"] = effective_cfg
+
+            parsed_size = self._parse_size(effective_size)
             if parsed_size:
                 call_kwargs["width"], call_kwargs["height"] = parsed_size
 
             if sampler:
-                print(f"[BananaService] [SD模式] 当前调度器: {pipe.scheduler.__class__.__name__} (请求 sampler={sampler})")
+                print(f"[BananaService] [SD模式] 当前调度器: {pipe.scheduler.__class__.__name__} (请求 sampler={sampler}，本地 SD 暂未切换 scheduler)")
 
             image = pipe(prompt, **call_kwargs).images[0]
 
@@ -145,7 +216,7 @@ class BananaService:
         except Exception as e:
             print(f"[BananaService] [ERROR] SD生成失败: {e}")
             print(traceback.format_exc())
-            raise
+            raise RuntimeError(f"本地 SD 生成失败：{e}") from e
 
     def generate_with_gemini(
         self,
@@ -200,6 +271,70 @@ class BananaService:
             print(traceback.format_exc())
             raise
 
+    def _resolve_model_name(self, mode: str) -> str:
+        if mode == "sd":
+            return SD_MODEL_ID
+        if mode == "gemini":
+            return GEMINI_MODEL
+        if mode == "proxy":
+            return REMOTE_MODEL_NAME
+        raise ValueError(f"不支持的生成模式: {mode}")
+
+    def _run_mode(
+        self,
+        active_mode: str,
+        prompt: str,
+        output_path: str,
+        negative_prompt: Optional[str] = None,
+        seed: Optional[int] = None,
+        steps: Optional[int] = None,
+        cfg: Optional[float] = None,
+        sampler: Optional[str] = None,
+        size: Optional[str] = None,
+    ) -> str:
+        if active_mode == "sd":
+            return self.generate_with_sd(
+                prompt,
+                output_path,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler=sampler,
+                size=size,
+            )
+        if active_mode == "gemini":
+            return self.generate_with_gemini(
+                prompt,
+                output_path,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler=sampler,
+                size=size,
+            )
+        if active_mode == "proxy":
+            return self.generate_with_proxy(
+                prompt,
+                output_path,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler=sampler,
+                size=size,
+            )
+        raise ValueError(f"不支持的生成模式: {active_mode}。支持的模式: 'sd', 'gemini', 'proxy'")
+
+    def get_mode_info(self, mode: str = None) -> dict:
+        """Return active mode and model identifier."""
+        active_mode = mode or self.mode
+        return {
+            "mode": active_mode,
+            "model_used": self._resolve_model_name(active_mode),
+        }
+
     def generate(
         self,
         prompt: str,
@@ -211,16 +346,16 @@ class BananaService:
         cfg: Optional[float] = None,
         sampler: Optional[str] = None,
         size: Optional[str] = None,
-    ):
+    ) -> Dict[str, Any]:
         """
         统一生成接口 (支持三种模式)
         :param prompt: 生成提示词
         :param output_path: 输出图片路径
         :param mode: 'sd' (本地), 'gemini' (Google API), 'proxy' (远程代理), None (使用默认模式)
-        :return: 生成的图片路径
+        :return: 生成结果及实际后端元信息
         """
-        # 使用指定模式或默认模式
-        active_mode = mode or self.mode
+        requested_mode = mode
+        active_mode = requested_mode or self.mode
 
         print(f"\n[BananaService] ========== 开始生成任务 ==========")
         print(f"[BananaService] 模式: {active_mode}")
@@ -228,58 +363,61 @@ class BananaService:
         print(f"[BananaService] 输出路径: {output_path}")
 
         try:
-            if active_mode == "sd":
-                return self.generate_with_sd(
-                    prompt,
-                    output_path,
-                    negative_prompt=negative_prompt,
-                    seed=seed,
-                    steps=steps,
-                    cfg=cfg,
-                    sampler=sampler,
-                    size=size,
-                )
-            if active_mode == "gemini":
-                return self.generate_with_gemini(
-                    prompt,
-                    output_path,
-                    negative_prompt=negative_prompt,
-                    seed=seed,
-                    steps=steps,
-                    cfg=cfg,
-                    sampler=sampler,
-                    size=size,
-                )
-            if active_mode == "proxy":
-                return self.generate_with_proxy(
-                    prompt,
-                    output_path,
-                    negative_prompt=negative_prompt,
-                    seed=seed,
-                    steps=steps,
-                    cfg=cfg,
-                    sampler=sampler,
-                    size=size,
-                )
-            raise ValueError(f"不支持的生成模式: {active_mode}。支持的模式: 'sd', 'gemini', 'proxy'")
+            result_path = self._run_mode(
+                active_mode,
+                prompt,
+                output_path,
+                negative_prompt=negative_prompt,
+                seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler=sampler,
+                size=size,
+            )
+            return {
+                "output_path": result_path,
+                "requested_mode": requested_mode,
+                "actual_mode": active_mode,
+                "model_used": self._resolve_model_name(active_mode),
+                "fallback_used": False,
+                "fallback_from": None,
+            }
+        except Exception as primary_error:
+            fallback_allowed = (
+                IMAGE_GEN_FALLBACK_ENABLED
+                and active_mode in IMAGE_GEN_FALLBACK_FROM
+                and active_mode != IMAGE_GEN_FALLBACK_TARGET
+            )
+            if not fallback_allowed:
+                print(f"[BananaService] [FATAL] 生成任务失败: {str(primary_error)}")
+                raise
 
-        except Exception as e:
-            print(f"[BananaService] [FATAL] 生成任务失败: {str(e)}")
-            raise
-
-    def get_mode_info(self, mode: str = None) -> dict:
-        """Return active mode and model identifier."""
-        active_mode = mode or self.mode
-        if active_mode == "sd":
-            model_name = SD_MODEL_ID
-        elif active_mode == "gemini":
-            model_name = GEMINI_MODEL
-        else:
-            model_name = REMOTE_MODEL_NAME
-        return {
-            "mode": active_mode,
-            "model_used": model_name,
-        }
+            print(
+                f"[BananaService] [WARN] {active_mode} 生成失败，尝试回退到 {IMAGE_GEN_FALLBACK_TARGET}: {primary_error}"
+            )
+            try:
+                result_path = self._run_mode(
+                    IMAGE_GEN_FALLBACK_TARGET,
+                    prompt,
+                    output_path,
+                    negative_prompt=negative_prompt,
+                    seed=seed,
+                    steps=steps,
+                    cfg=cfg,
+                    sampler=sampler,
+                    size=size,
+                )
+                return {
+                    "output_path": result_path,
+                    "requested_mode": requested_mode,
+                    "actual_mode": IMAGE_GEN_FALLBACK_TARGET,
+                    "model_used": self._resolve_model_name(IMAGE_GEN_FALLBACK_TARGET),
+                    "fallback_used": True,
+                    "fallback_from": active_mode,
+                }
+            except Exception as fallback_error:
+                print(f"[BananaService] [FATAL] 回退生成失败: {fallback_error}")
+                raise fallback_error from primary_error
 
     def _save_data_url(self, data_url: str, output_path: str):
         if not isinstance(data_url, str) or not data_url.startswith("data:image"):
@@ -436,7 +574,12 @@ class BananaService:
         try:
             print(f"[BananaService] 优先请求 /responses: {responses_url}")
             try:
-                response = requests.post(responses_url, headers=headers, json=responses_payload, timeout=480)
+                response = requests.post(
+                    responses_url,
+                    headers=headers,
+                    json=responses_payload,
+                    timeout=(PROXY_CONNECT_TIMEOUT_SECONDS, PROXY_READ_TIMEOUT_SECONDS),
+                )
                 responses_status = response.status_code
                 responses_preview = (response.text or "")[:4000]
                 print(f"[BananaService] /responses 状态码: {responses_status}")
@@ -457,11 +600,26 @@ class BananaService:
                     print("[BananaService] [WARN] /responses 返回成功但无可用图片，回退到 /chat/completions")
                 else:
                     print("[BananaService] [WARN] /responses endpoint 不支持或请求失败，回退到 /chat/completions")
+            except (RequestsConnectionError, ConnectTimeout, ReadTimeout) as responses_err:
+                print(f"[BananaService] [WARN] /responses 调用异常，回退到 /chat/completions: {responses_err}")
+                responses_preview = f"proxy_unreachable: {responses_err}"
             except Exception as responses_err:
                 print(f"[BananaService] [WARN] /responses 调用异常，回退到 /chat/completions: {responses_err}")
 
             print(f"[BananaService] 回退请求 /chat/completions (stream): {chat_url}")
-            response = requests.post(chat_url, headers=headers, json=chat_payload, timeout=480, stream=True)
+            try:
+                response = requests.post(
+                    chat_url,
+                    headers=headers,
+                    json=chat_payload,
+                    timeout=(PROXY_CONNECT_TIMEOUT_SECONDS, PROXY_READ_TIMEOUT_SECONDS),
+                    stream=True,
+                )
+            except (RequestsConnectionError, ConnectTimeout, ReadTimeout) as exc:
+                raise RuntimeError(
+                    f"远程 proxy 不可用：无法连接到 {chat_url}。"
+                    "请先启动代理服务，或在前端把生成模式切到默认/本地 sd。"
+                ) from exc
             chat_status = response.status_code
             print(f"[BananaService] /chat/completions 状态码: {chat_status}")
 
@@ -608,7 +766,7 @@ class BananaService:
         except Exception as e:
             print(f"[BananaService] [EXCEPTION] 发生异常: {str(e)}")
             print(traceback.format_exc())
-            raise
+            raise RuntimeError(f"远程 proxy 生成失败：{e}") from e
 
 
 # 全局单例 (默认使用环境变量配置的模式)

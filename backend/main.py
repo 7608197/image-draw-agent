@@ -8,20 +8,37 @@
 4) 挂载 outputs 静态目录，便于前端直接访问生成产物
 """
 from typing import Any, Dict, Optional, List
+from queue import Queue
+from dataclasses import dataclass
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
 import time
 import uuid
 import json as jsonlib
+import threading
 
 # Pydantic 响应模型（约束 API 输出结构）
-from schemas import ReverseResponse, ErrorResponse, GenerateResponse, GenerateMeta, ParamsBlock
+from schemas import (
+    ReverseResponse,
+    ErrorResponse,
+    GenerateResponse,
+    GenerateMeta,
+    ParamsBlock,
+    TextReverseRequest,
+    AgentChatRequest,
+    AgentChatResponse,
+    AgentConfirmRequest,
+    AgentConfirmEvent,
+    AgentConfirmOption,
+)
 # 图生文核心服务（图片分析、结构化构建、prompt 编译）
 from services.reverse_service import reverse_service
+from services.prompt_agent import prompt_agent
 # 文生图核心服务（支持 sd / gemini / proxy 三种生成模式）
 from services.banana_service_flow2 import banana_service
 
@@ -56,6 +73,24 @@ app.add_middleware(
 # - gemini: Google Gemini 图片生成
 # - proxy: 远程代理（OpenAI 兼容接口）
 VALID_MODES = {"sd", "gemini", "proxy"}
+AGENT_CONFIRM_OPTIONS = [
+    AgentConfirmOption(id="accept_all", label="Accept all"),
+    AgentConfirmOption(id="submit_selection", label="提交选择"),
+    AgentConfirmOption(id="other", label="Other"),
+    AgentConfirmOption(id="cancel", label="Cancel"),
+]
+PENDING_CONFIRM_TTL_SECONDS = 600
+
+
+@dataclass
+class PendingAgentConfirmation:
+    user_input: str
+    current_prompt: Any
+    patch: Any
+    created_at: float
+
+
+pending_agent_confirmations: Dict[str, PendingAgentConfirmation] = {}
 
 # 当请求未给出参数时使用的默认生成参数。
 DEFAULT_GENERATE_PARAMS = {
@@ -230,6 +265,33 @@ def _merge_unique(items: List[str], extra_items: List[str]) -> List[str]:
     return merged
 
 
+def _cleanup_pending_confirmations() -> None:
+    now = time.time()
+    expired_ids = [
+        confirmation_id
+        for confirmation_id, item in pending_agent_confirmations.items()
+        if now - item.created_at > PENDING_CONFIRM_TTL_SECONDS
+    ]
+    for confirmation_id in expired_ids:
+        pending_agent_confirmations.pop(confirmation_id, None)
+
+
+def _build_agent_chat_response(updated_prompt, message_text: str = "已根据你的要求更新结构化提示词。") -> AgentChatResponse:
+    compiled = reverse_service.compile_structured_prompt(updated_prompt)
+    return AgentChatResponse(
+        message=message_text,
+        updated_prompt=updated_prompt,
+        prompt=(compiled.get("positive") or "").strip() or None,
+        negative_prompt=(compiled.get("negative") or "").strip() or None,
+    )
+
+
+def _filter_patch_operations(patch, selected_indexes: List[int]):
+    valid_indexes = {index for index in selected_indexes if 0 <= index < len(patch.operations)}
+    selected_operations = [operation for index, operation in enumerate(patch.operations) if index in valid_indexes]
+    return patch.model_copy(update={"operations": selected_operations})
+
+
 def _apply_style_preset_to_structured(structured_data: Dict[str, Any], style_name: Optional[str]):
     """
     将风格预设融合到 structured 数据中。
@@ -372,6 +434,203 @@ async def reverse_image(
 # 文生图接口：POST /generate
 # ------------------------------
 @app.post(
+    "/reverse/text",
+    response_model=ReverseResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid input"},
+        500: {"model": ErrorResponse, "description": "Internal server error"}
+    },
+    summary="Normalize natural language into structured prompt",
+    description="Submit natural language text to generate a normalized caption, structured prompt, and compiled prompt"
+)
+async def reverse_text(request: TextReverseRequest):
+    try:
+        result = await reverse_service.reverse_text(request.text, request.params)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal processing error: {str(e)}")
+
+
+@app.post(
+    "/agent/chat",
+    response_model=AgentChatResponse,
+    responses={
+        400: {"model": ErrorResponse, "description": "Invalid input"},
+        500: {"model": ErrorResponse, "description": "Internal server error"}
+    },
+    summary="Edit structured prompt through agent chat",
+    description="Submit a natural language editing instruction and the current structured prompt"
+)
+async def agent_chat(request: AgentChatRequest):
+    try:
+        updated_prompt = prompt_agent.run_simple(request.user_input, request.current_prompt)
+        return _build_agent_chat_response(updated_prompt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal processing error: {str(e)}")
+
+
+@app.post(
+    "/agent/chat/stream",
+    summary="Stream agent chat progress",
+    description="Submit a natural language editing instruction and stream live agent status updates"
+)
+async def agent_chat_stream(request: AgentChatRequest):
+    event_queue: Queue = Queue()
+
+    def emit(event_type: str, payload: Dict[str, Any]):
+        event_queue.put(f"data: {jsonlib.dumps({'type': event_type, **payload}, ensure_ascii=False)}\n\n")
+
+    def worker():
+        try:
+            _cleanup_pending_confirmations()
+            emit("status", {"message": "开始处理你的修改请求"})
+            patch = prompt_agent.prepare_patch(
+                request.user_input,
+                request.current_prompt,
+                progress_callback=lambda msg: emit("status", {"message": msg}),
+            )
+            confirmation_id = uuid.uuid4().hex
+            pending_agent_confirmations[confirmation_id] = PendingAgentConfirmation(
+                user_input=request.user_input,
+                current_prompt=request.current_prompt.model_copy(deep=True),
+                patch=patch,
+                created_at=time.time(),
+            )
+            confirm_event = AgentConfirmEvent(
+                confirmation_id=confirmation_id,
+                message="已生成修改方案，请逐条确认是否应用到当前结构化提示词。",
+                summary=patch.summary,
+                reasoning=patch.reasoning,
+                operations=patch.operations,
+                options=AGENT_CONFIRM_OPTIONS,
+            )
+            emit("confirm", confirm_event.model_dump())
+        except ValueError as e:
+            emit("error", {"message": str(e)})
+        except Exception as e:
+            emit("error", {"message": f"Internal processing error: {str(e)}"})
+        finally:
+            emit("done", {})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def event_stream():
+        while True:
+            chunk = event_queue.get()
+            yield chunk
+            if '"type": "done"' in chunk:
+                break
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")
+
+
+@app.post(
+    "/agent/chat/confirm",
+    summary="Confirm or cancel a pending agent patch",
+    description="Resume a previously prepared agent patch by applying or cancelling it with streamed status updates"
+)
+async def agent_chat_confirm(request: AgentConfirmRequest):
+    event_queue: Queue = Queue()
+
+    def emit(event_type: str, payload: Dict[str, Any]):
+        event_queue.put(f"data: {jsonlib.dumps({'type': event_type, **payload}, ensure_ascii=False)}\n\n")
+
+    def worker():
+        try:
+            _cleanup_pending_confirmations()
+            pending = pending_agent_confirmations.pop(request.confirmation_id, None)
+            if pending is None:
+                emit("error", {"message": "确认请求已失效，请重新发起修改。"})
+                return
+
+            if request.mode == "cancel" or request.choice == "cancel":
+                emit("status", {"message": "已取消本次修改"})
+                response = _build_agent_chat_response(
+                    pending.current_prompt,
+                    message_text="已取消本次修改，当前结构化提示词保持不变。",
+                )
+                emit("result", response.model_dump())
+                return
+
+            if request.mode == "custom_prompt":
+                custom_text = (request.custom_text or "").strip()
+                if not custom_text:
+                    emit("error", {"message": "Other 模式需要提供补充说明。"})
+                    return
+                emit("status", {"message": "正在根据你的补充说明重新生成方案"})
+                patch = prompt_agent.prepare_patch(
+                    custom_text,
+                    pending.current_prompt,
+                    progress_callback=lambda msg: emit("status", {"message": msg}),
+                )
+                confirmation_id = uuid.uuid4().hex
+                pending_agent_confirmations[confirmation_id] = PendingAgentConfirmation(
+                    user_input=custom_text,
+                    current_prompt=pending.current_prompt.model_copy(deep=True),
+                    patch=patch,
+                    created_at=time.time(),
+                )
+                confirm_event = AgentConfirmEvent(
+                    confirmation_id=confirmation_id,
+                    message="已根据补充说明生成新的修改方案，请继续确认。",
+                    summary=patch.summary,
+                    reasoning=patch.reasoning,
+                    operations=patch.operations,
+                    options=AGENT_CONFIRM_OPTIONS,
+                )
+                emit("confirm", confirm_event.model_dump())
+                return
+
+            patch_to_apply = pending.patch
+            if request.mode == "multi" or request.choice == "submit_selection":
+                patch_to_apply = _filter_patch_operations(pending.patch, request.selected_operation_indexes)
+                if not patch_to_apply.operations:
+                    emit("status", {"message": "你没有选择任何操作，当前结构化提示词保持不变。"})
+                    response = _build_agent_chat_response(
+                        pending.current_prompt,
+                        message_text="未应用任何修改，当前结构化提示词保持不变。",
+                    )
+                    emit("result", response.model_dump())
+                    return
+                emit("status", {"message": f"将只应用你确认的 {len(patch_to_apply.operations)} 个操作"})
+            elif request.mode != "accept_all" and request.choice != "accept_all":
+                emit("error", {"message": f"Unsupported confirmation mode: {request.mode}"})
+                return
+
+            emit("status", {"message": "正在应用补丁"})
+            updated_prompt = prompt_agent.apply_patch(
+                pending.current_prompt,
+                patch_to_apply,
+                progress_callback=lambda msg: emit("status", {"message": msg}),
+            )
+            emit("status", {"message": "正在编译最终 prompt"})
+            response = _build_agent_chat_response(updated_prompt)
+            emit("status", {"message": "修改完成"})
+            emit("result", response.model_dump())
+        except ValueError as e:
+            emit("error", {"message": str(e)})
+        except Exception as e:
+            emit("error", {"message": f"Internal processing error: {str(e)}"})
+        finally:
+            emit("done", {})
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    def event_stream():
+        while True:
+            chunk = event_queue.get()
+            yield chunk
+            if '"type": "done"' in chunk:
+                break
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream; charset=utf-8")
+
+
+@app.post(
     "/generate",
     response_model=GenerateResponse,
     responses={
@@ -466,6 +725,7 @@ async def generate_image(
     effective_sampler = str(effective_sampler).strip() or DEFAULT_GENERATE_PARAMS["sampler"]
     effective_seed = _ensure_seed(seed if seed is not None else structured_params.get("seed"))
 
+
     # prompt_source 用于告诉前端“这次生成到底用了哪种 prompt 来源”。
     prompt_source = "legacy"
     style_applied = None
@@ -533,7 +793,7 @@ async def generate_image(
     # 10) 调用底层生成服务。
     start_time = time.time()
     try:
-        result = banana_service.generate(
+        generation_result = banana_service.generate(
             positive_prompt,
             output_path,
             mode=effective_mode,
@@ -544,9 +804,8 @@ async def generate_image(
             sampler=effective_sampler,
             size=effective_size,
         )
-        if not result:
+        if not generation_result or not generation_result.get("output_path"):
             raise RuntimeError("No image generated")
-        mode_info = banana_service.get_mode_info(mode=effective_mode)
     except HTTPException:
         # 已经是标准 HTTP 异常，直接透传。
         raise
@@ -562,8 +821,10 @@ async def generate_image(
     image_url = f"/outputs/generate/{generation_id}.png"
 
     # 复现等级：只有 SD 且固定了 seed 时，可认为强复现。
+    actual_mode = generation_result.get("actual_mode")
+    requested_mode = generation_result.get("requested_mode")
     reproducibility = "best_effort"
-    if mode_info.get("mode") == "sd" and effective_seed is not None:
+    if actual_mode == "sd" and effective_seed is not None:
         reproducibility = "strong"
 
     # 12) 按约定 schema 返回。
@@ -572,13 +833,16 @@ async def generate_image(
         prompt=positive_prompt or "[json-spec]",
         image_url=image_url,
         meta=GenerateMeta(
-            model_used=mode_info["model_used"],
+            model_used=generation_result["model_used"],
             processing_time_ms=processing_time_ms,
-            mode=mode_info.get("mode"),
+            mode=actual_mode,
+            requested_mode=requested_mode,
+            fallback_used=generation_result.get("fallback_used"),
+            fallback_from=generation_result.get("fallback_from"),
             reproducibility=reproducibility,
             style_applied=style_applied,
             effective_params={
-                "mode": mode_info.get("mode"),
+                "mode": actual_mode,
                 "size": effective_size,
                 "steps": effective_steps,
                 "cfg": effective_cfg,

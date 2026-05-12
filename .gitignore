@@ -17,6 +17,10 @@ outputs/
 
 # Secrets
 frontend/.env
+backend/.env
+
+# Local toolchain cache
+.tools/
 
 # Generated test artifacts
 tests/images/test_output_*.png

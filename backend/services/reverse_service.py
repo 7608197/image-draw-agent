@@ -49,8 +49,8 @@ class ReverseService:
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self.gemini_model = os.getenv("GEMINI_VISION_MODEL", "gemini-2.0-flash")
         self.gemini_client = None
-        self.cliproxy_base_url = os.getenv("CLIPROXY_BASE_URL", "http://192.168.1.110:8317/v1")
-        self.cliproxy_api_key = os.getenv("CLIPROXY_API_KEY", "sk-cpa-7d9k2m5p8r4v1x6w9q")
+        self.cliproxy_base_url = os.getenv("CLIPROXY_BASE_URL", "")
+        self.cliproxy_api_key = os.getenv("CLIPROXY_API_KEY", "")
         self.cliproxy_model = os.getenv("CLIPROXY_MODEL", "gpt-5.4")
         self.cliproxy_image_format = os.getenv("CLIPROXY_IMAGE_FORMAT", "auto").lower()
         self.stub_model_name = "STUB-Vision-v2"
@@ -736,7 +736,7 @@ class ReverseService:
                     ],
                 }
 
-                response = requests.post(responses_endpoint, headers=headers, json=responses_payload, timeout=60)
+                response = requests.post(responses_endpoint, headers=headers, json=responses_payload, timeout=120)
                 if response.status_code == 200:
                     data = response.json()
                     content = self._extract_responses_text(data)
@@ -745,7 +745,7 @@ class ReverseService:
                             responses_endpoint,
                             headers=headers,
                             json={**responses_payload, "stream": True},
-                            timeout=60,
+                            timeout=120,
                             stream=True,
                         )
                         if stream_response.status_code == 200:
@@ -772,7 +772,7 @@ class ReverseService:
                 else:
                     last_error = f"responses {item['name']}: {response.status_code} {response.text}"
 
-            response = requests.post(chat_endpoint, headers=headers, json=item["payload"], timeout=60)
+            response = requests.post(chat_endpoint, headers=headers, json=item["payload"], timeout=120)
             if response.status_code != 200:
                 last_error = f"chat {item['name']}: {response.status_code} {response.text}"
                 continue
@@ -837,7 +837,7 @@ class ReverseService:
             ],
         }
 
-        response = requests.post(responses_endpoint, headers=headers, json=payload, timeout=60)
+        response = requests.post(responses_endpoint, headers=headers, json=payload, timeout=120)
         if response.status_code == 200:
             data = response.json()
             content = self._extract_responses_text(data)
@@ -846,7 +846,7 @@ class ReverseService:
                     responses_endpoint,
                     headers=headers,
                     json={**payload, "stream": True},
-                    timeout=60,
+                    timeout=120,
                     stream=True,
                 )
                 if stream_response.status_code == 200:
@@ -879,7 +879,7 @@ class ReverseService:
                 }
             ],
         }
-        chat_response = requests.post(chat_endpoint, headers=headers, json=chat_payload, timeout=60)
+        chat_response = requests.post(chat_endpoint, headers=headers, json=chat_payload, timeout=120)
         if chat_response.status_code != 200:
             raise RuntimeError(f"text chat: {chat_response.status_code} {chat_response.text}")
 
